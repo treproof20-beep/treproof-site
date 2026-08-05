@@ -6,9 +6,11 @@ const fs = require('fs');
 const PORT = process.env.PORT || 3000;
 const DB_PATH = process.env.DB_PATH || './data/leads.db';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+// Resend — used to send the "new lead" notification email (free tier: 100/day, 3 domains)
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const ALERT_EMAIL = process.env.ALERT_EMAIL || '';
-const FROM_EMAIL = process.env.FROM_EMAIL || 'onboarding@resend.dev';
+const ALERT_EMAIL = process.env.ALERT_EMAIL || '';           // where notifications land — any inbox you already own
+const FROM_EMAIL = process.env.FROM_EMAIL || 'onboarding@resend.dev'; // e.g. "TreProof <leads@treproof.com>" once domain is verified
 
 // Make sure the folder for the DB file exists (matters if DB_PATH points into a mounted volume)
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -61,20 +63,20 @@ app.post('/api/leads', (req, res) => {
   res.json({ ok: true });
 });
 
-// --- optional email notification via Resend (skips silently if not configured) ---
+// --- email notification via Resend (skips silently if not configured) ---
 async function notifyByEmail(lead) {
   if (!RESEND_API_KEY || !ALERT_EMAIL) return;
 
   const text = [
-    `New lead from TreProof`,
-    `Name: ${lead.name}`,
-    `Contact: ${lead.contact}`,
-    `Asset/bank: ${lead.asset || '-'}`,
-    `Amount: ${lead.amount || '-'}`,
-    `When: ${lead.when || '-'}`,
-    `Language: ${lead.lang || '-'}`,
+    `Новая заявка — TreProof`,
+    `Имя: ${lead.name}`,
+    `Контакт: ${lead.contact}`,
+    `Актив/банк: ${lead.asset || '-'}`,
+    `Сумма: ${lead.amount || '-'}`,
+    `Когда: ${lead.when || '-'}`,
+    `Язык: ${lead.lang || '-'}`,
     ``,
-    `Description:`,
+    `Описание:`,
     lead.desc
   ].join('\n');
 
@@ -87,7 +89,7 @@ async function notifyByEmail(lead) {
     body: JSON.stringify({
       from: FROM_EMAIL,
       to: ALERT_EMAIL,
-      subject: `New lead — ${lead.name}`,
+      subject: `Новая заявка — ${lead.name}`,
       text
     })
   });
