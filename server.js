@@ -2,18 +2,44 @@ const express = require('express');
 const path = require('path');
 const Database = require('better-sqlite3');
 const fs = require('fs');
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 
 const PORT = process.env.PORT || 3000;
 const DB_PATH = process.env.DB_PATH || './data/leads.db';
-const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const ADMIN_KEY = process.env.ADMIN_KEY || ''; // this is now your admin PASSWORD, entered on a login page
+
+// Secret path segment — makes the whole admin area unguessable, not just password-protected.
+// Set ADMIN_PATH in Railway to something long and random, e.g. "panel-7k2m9xq4vw".
+// If not set, falls back to "admin" (guessable — fine for local testing, not for production).
+const ADMIN_PATH = (process.env.ADMIN_PATH || 'admin').replace(/^\/+|\/+$/g, '') || 'admin';
 
 // Resend — used to send the "new lead" notification email (free tier: 100/day, 3 domains)
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const ALERT_EMAIL = process.env.ALERT_EMAIL || '';           // where notifications land — any inbox you already own
 const FROM_EMAIL = process.env.FROM_EMAIL || 'onboarding@resend.dev'; // e.g. "TreProof <leads@treproof.com>" once domain is verified
 
+const SESSION_DAYS = 7;
+
 // Make sure the folder for the DB file exists (matters if DB_PATH points into a mounted volume)
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+// Basic anti-spam: at most 5 submissions per 15 minutes per IP
+const leadsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'too_many_requests' }
+});
+
+// Slow down repeated password guesses at /admin/login
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
 const db = new Database(DB_PATH);
 db.exec(`
@@ -23,16 +49,86 @@ db.exec(`
     name TEXT, contact TEXT, asset TEXT, amount TEXT,
     happened_when TEXT, description TEXT, lang TEXT,
     ip TEXT
-  )
+  );
+  CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+  );
 `);
 
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// --- tiny cookie helpers (no extra dependency needed) ---
+function parseCookies(req) {
+  const header = req.headers.cookie || '';
+  const out = {};
+  header.split(';').forEach(part => {
+    const idx = part.indexOf('=');
+    if (idx === -1) return;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (k) out[k] = decodeURIComponent(v);
+  });
+  return out;
+}
+function setCookie(req, res, name, value, maxAgeSeconds) {
+  const isHttps = req.headers['x-forwarded-proto'] === 'https' || req.protocol === 'https';
+  const parts = [
+    `${name}=${encodeURIComponent(value)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${maxAgeSeconds}`
+  ];
+  if (isHttps) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+function clearCookie(req, res, name) {
+  const isHttps = req.headers['x-forwarded-proto'] === 'https' || req.protocol === 'https';
+  const parts = [`${name}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  if (isHttps) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+// --- session helpers ---
+function createSession() {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expires = new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO sessions (token, expires_at) VALUES (?, ?)').run(token, expires);
+  return token;
+}
+function isValidSession(token) {
+  if (!token) return false;
+  const row = db.prepare('SELECT expires_at FROM sessions WHERE token = ?').get(token);
+  if (!row) return false;
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
+    return false;
+  }
+  return true;
+}
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a));
+  const bufB = Buffer.from(String(b));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+function requireAdmin(req, res, next) {
+  const cookies = parseCookies(req);
+  if (ADMIN_KEY && isValidSession(cookies.sid)) return next();
+  res.redirect(`/${ADMIN_PATH}/login`);
+}
+
 // --- receive a lead from the site form ---
-app.post('/api/leads', (req, res) => {
-  const { name, contact, asset, amount, when, desc, lang } = req.body || {};
+app.post('/api/leads', leadsLimiter, (req, res) => {
+  const { name, contact, asset, amount, when, desc, lang, website } = req.body || {};
+
+  // Honeypot: real visitors never see or fill this field — bots that auto-fill every input do.
+  if (website) {
+    return res.json({ ok: true }); // pretend success, silently drop
+  }
 
   if (!name || !contact || !desc) {
     return res.status(400).json({ ok: false, error: 'missing_required_fields' });
@@ -100,12 +196,55 @@ async function notifyByEmail(lead) {
   }
 }
 
-// --- simple password-protected admin view of all leads ---
-app.get('/admin/leads', (req, res) => {
-  if (!ADMIN_KEY || req.query.key !== ADMIN_KEY) {
-    return res.status(401).send('Unauthorized. Add ?key=YOUR_ADMIN_KEY to the URL.');
-  }
+// --- admin: login page ---
+app.get(`/${ADMIN_PATH}/login`, (req, res) => {
+  const adminBase = `/${ADMIN_PATH}`;
+  const cookies = parseCookies(req);
+  if (ADMIN_KEY && isValidSession(cookies.sid)) return res.redirect(`/${ADMIN_PATH}/leads`);
 
+  const err = req.query.err ? '<p style="color:#b3261e;font-size:14px;margin:0 0 14px">Неверный пароль.</p>' : '';
+  res.send(`
+    <!DOCTYPE html><html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Вход — TreProof</title>
+    <style>
+      body{font-family:system-ui,sans-serif;background:#faf6f0;color:#241f1a;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+      form{background:#fff;padding:32px;border-radius:16px;box-shadow:0 10px 30px -12px rgba(0,0,0,.15);width:280px}
+      h1{font-size:18px;margin:0 0 18px}
+      input{width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #e2d6c3;border-radius:8px;font-size:14px;margin-bottom:14px}
+      button{width:100%;padding:11px;background:#241f1a;color:#fff;border:none;border-radius:8px;font-weight:700;cursor:pointer;font-size:14px}
+    </style></head>
+    <body>
+      <form method="POST" action="${adminBase}/login">
+        <h1>Вход в панель заявок</h1>
+        ${err}
+        <input type="password" name="password" placeholder="Пароль" autofocus required>
+        <button type="submit">Войти</button>
+      </form>
+    </body></html>
+  `);
+});
+
+app.post(`/${ADMIN_PATH}/login`, loginLimiter, express.urlencoded({ extended: false }), (req, res) => {
+  const password = (req.body && req.body.password) || '';
+  if (!ADMIN_KEY || !safeEqual(password, ADMIN_KEY)) {
+    return res.redirect(`/${ADMIN_PATH}/login?err=1`);
+  }
+  const token = createSession();
+  setCookie(req, res, 'sid', token, SESSION_DAYS * 24 * 60 * 60);
+  res.redirect(`/${ADMIN_PATH}/leads`);
+});
+
+app.post(`/${ADMIN_PATH}/logout`, (req, res) => {
+  const cookies = parseCookies(req);
+  if (cookies.sid) db.prepare('DELETE FROM sessions WHERE token = ?').run(cookies.sid);
+  clearCookie(req, res, 'sid');
+  res.redirect(`/${ADMIN_PATH}/login`);
+});
+
+// --- admin: leads table (requires a valid login session) ---
+app.get(`/${ADMIN_PATH}/leads`, requireAdmin, (req, res) => {
+  const adminBase = `/${ADMIN_PATH}`;
   const rows = db.prepare('SELECT * FROM leads ORDER BY id DESC').all();
 
   const escape = s => String(s || '').replace(/[&<>"']/g, c => ({
@@ -128,16 +267,22 @@ app.get('/admin/leads', (req, res) => {
 
   res.send(`
     <!DOCTYPE html><html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Leads — TreProof</title>
     <style>
       body{font-family:system-ui,sans-serif;padding:24px;background:#faf6f0;color:#241f1a}
+      .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
       table{border-collapse:collapse;width:100%;background:#fff}
       th,td{border:1px solid #e2d6c3;padding:8px 10px;font-size:13px;text-align:left;vertical-align:top}
       th{background:#f4ece0;position:sticky;top:0}
-      h1{font-size:20px}
+      h1{font-size:20px;margin:0}
+      button{padding:8px 14px;border:1px solid #e2d6c3;background:#fff;border-radius:8px;cursor:pointer;font-size:13px}
     </style></head>
     <body>
-      <h1>Leads (${rows.length})</h1>
+      <div class="top">
+        <h1>Leads (${rows.length})</h1>
+        <form method="POST" action="${adminBase}/logout"><button type="submit">Выйти</button></form>
+      </div>
       <table>
         <thead><tr>
           <th>#</th><th>Date</th><th>Name</th><th>Contact</th><th>Asset/bank</th>

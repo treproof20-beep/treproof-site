@@ -880,6 +880,9 @@
     <div class="intake">
       <form onsubmit="return sendForm(event)">
         <div class="fld"><label data-i18n="ct_name">Как к вам обращаться</label><input id="f_name" required></div>
+        <div class="fld" style="position:absolute;left:-9999px;top:-9999px;opacity:0;height:0;overflow:hidden" aria-hidden="true">
+          <label for="f_website">Website</label><input id="f_website" name="website" tabindex="-1" autocomplete="off">
+        </div>
         <div class="fld"><label data-i18n="ct_contact">Контакт (Telegram / email / телефон)</label><input id="f_contact" required></div>
         <div class="fld"><label data-i18n="ct_asset">Актив и сеть (крипто) или банк и валюта</label><input id="f_asset"></div>
         <div class="fld"><label data-i18n="ct_amount">Примерная сумма ущерба</label><input id="f_amount"></div>
@@ -1420,7 +1423,8 @@ function setLang(l){
  document.querySelectorAll('#lang button').forEach(b=>b.classList.toggle('on',b.dataset.l===l));
  applyStr(); render(); revealInit(); initTilt();
 }
-function go(id){
+function go(id, opts){
+ opts = opts || {};
  document.querySelectorAll('.page').forEach(p=>p.classList.remove('show'));
  (document.getElementById(id)||document.getElementById('home')).classList.add('show');
  document.querySelectorAll('.menu a').forEach(a=>a.classList.toggle('active',a.dataset.nav===id));
@@ -1430,6 +1434,10 @@ function go(id){
  const sc=document.getElementById('sideCta'); if(sc&&id==='contact')sc.classList.remove('show');
  window.scrollTo({top:0,behavior:'smooth'});
  setTimeout(()=>{revealInit();initTilt();},30);
+ if(!opts.skipHistory){
+   const hash='#/'+id;
+   if(location.hash!==hash) history.pushState({page:id},'',hash);
+ }
 }
 
 /* ---- contacts (EDIT THESE) — международные номера ---- */
@@ -1471,7 +1479,8 @@ function sendForm(e){
   method:'POST', headers:{'Content-Type':'application/json'},
   body:JSON.stringify({
    name:g('f_name'), contact:g('f_contact'), asset:g('f_asset'),
-   amount:g('f_amount'), when:g('f_when'), desc:g('f_desc'), lang:LANG
+   amount:g('f_amount'), when:g('f_when'), desc:g('f_desc'), lang:LANG,
+   website:g('f_website')
   })
  }).then(r=>{ if(!r.ok) throw new Error('bad status'); return r.json(); })
   .then(()=>{ btn.textContent=okMsg; btn.style.background='var(--green)';
@@ -1491,7 +1500,14 @@ function renderArt(slug){
  document.getElementById('arBody').innerHTML=t.body.map(b=>`<h2>${b[0]}</h2><p>${b[1]}</p>`).join('');
  document.title=t.title+' — TreProof';
 }
-function openArt(slug){ CUR_ART=slug; renderArt(slug); go('article'); location.hash='#/'+slug; }
+function openArt(slug, opts){
+ opts = opts || {};
+ CUR_ART=slug; renderArt(slug); go('article', {skipHistory:true});
+ if(!opts.skipHistory){
+   const hash='#/'+slug;
+   if(location.hash!==hash) history.pushState({article:slug},'',hash);
+ }
+}
 
 /* ---- live analysis panel (JS-driven, works with reduced motion too) ---- */
 function startPanel(){
@@ -1583,8 +1599,20 @@ document.querySelectorAll('#lang button').forEach(b=>b.addEventListener('click',
 initContacts();
 startPanel();
 setLang('ru');
+
+function routeFromHash(){
+ const h=(location.hash||'').replace('#/','');
+ if(h && ARTS.some(a=>a.slug===h)){ openArt(h,{skipHistory:true}); }
+ else if(h && document.getElementById(h)){ go(h,{skipHistory:true}); }
+ else { go('home',{skipHistory:true}); }
+}
+window.addEventListener('popstate', routeFromHash);
+
 const _h=(location.hash||'').replace('#/','');
-if(_h && ARTS.some(a=>a.slug===_h)){ openArt(_h); } else { go('home'); }
+if(_h && ARTS.some(a=>a.slug===_h)){ openArt(_h,{skipHistory:true}); history.replaceState({article:_h},'','#/'+_h); }
+else if(_h && document.getElementById(_h)){ go(_h,{skipHistory:true}); history.replaceState({page:_h},'','#/'+_h); }
+else { go('home',{skipHistory:true}); history.replaceState({page:'home'},'','#/home'); }
+
 </script>
 </body>
 </html>
